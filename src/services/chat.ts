@@ -6,13 +6,14 @@ import { HttpError } from "../httpError";
 import { normalizeQuestion } from "../text";
 import { buildExtractiveAnswer, type Citation } from "../answer/extractive";
 import { buildLlmAnswer } from "../answer/llm";
+import { buildLocalLlmAnswer } from "../answer/llmLocal";
 import { hybridSearch } from "../retrieval/search";
 
 export interface ChatResult {
   id: string;
   answer: string;
   citations: Citation[];
-  answerMode: "extractive" | "llm";
+  answerMode: "extractive" | "llm" | "gpu";
   latencyMs: number;
   cached: boolean;
   cacheHits?: number;
@@ -92,7 +93,7 @@ export async function answerQuestion(userId: string, setId: string, question: st
     const row = cachedRes.rows[0];
     const latencyMs = Math.round(performance.now() - started);
     const id = await logChat(userId, setId, question, row.answer, mode, latencyMs, true);
-    return { id, answer: row.answer, citations: row.citations, answerMode: row.answer_mode as "extractive" | "llm", latencyMs, cached: true, cacheHits: row.hits };
+    return { id, answer: row.answer, citations: row.citations, answerMode: row.answer_mode as "extractive" | "llm" | "gpu", latencyMs, cached: true, cacheHits: row.hits };
   }
 
   // 4. Retrieval: embed the question, then hybrid (vector + full-text) search inside the set.
@@ -104,7 +105,14 @@ export async function answerQuestion(userId: string, setId: string, question: st
   const extractive = buildExtractiveAnswer(question, hits);
   const citations = extractive.citations;
   let answer: string;
-  if (mode === "llm") {
+  if (mode === "gpu") {
+    try {
+      answer = await buildLocalLlmAnswer(question, hits);
+    } catch {
+      // Graceful degradation: local model unavailable -> quoted extractive answer.
+      answer = `${extractive.answer}\n\n(Local GPU model was unavailable, so this answer was assembled extractively.)`;
+    }
+  } else if (mode === "llm") {
     try {
       answer = await buildLlmAnswer(question, hits);
     } catch {

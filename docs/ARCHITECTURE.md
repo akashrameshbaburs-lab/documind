@@ -1,224 +1,353 @@
 # DocuMind AI — Architecture
 
-This document describes how the system works internally: data flow, storage schema,
-retrieval math, and the decisions behind them.
+How the system actually works: data flow, storage schema, retrieval math, and the
+reasoning behind each decision. Everything described here exists in the repository;
+the *Roadmap* section at the end lists the things that deliberately do not.
 
 ---
 
-## 1. High-level components
+## 1. Components
 
 ```
-                 ┌────────────────────────────────────────────────┐
-                 │                 Express app (:3200)            │
-                 │                                                │
-  browser  ──────►  public/ SPA        routes/  (zod-validated)   │
-  client         │                        │                       │
-                 │   auth/  scrypt + JWT  │                       │
-                 │                        ▼                       │
-                 │        services/  documents · chat             │
-                 │            │                │                  │
-                 │            ▼                ▼                  │
-                 │      ingest/           retrieval/              │
-                 │   extract → chunk      hybrid + RRF            │
-                 │        │                    │                  │
-                 │        ▼                    ▼                  │
-                 │   embeddings/          answer/extractive       │
-                 │  hashing (offline)          │                  │
-                 └────────────┬────────────────┬──────────────────┘
-                              ▼                ▼
-                 ┌────────────────────────────────────────────────┐
-                 │     PostgreSQL 16 + pgvector  (:5434→5432)     │
-                 │  documents · chunks(embedding vector(1536))    │
-                 │  answer_cache · usage_counters · feedback      │
-                 └────────────────────────────────────────────────┘
+                 ┌──────────────────────────────────────────────────────┐
+                 │                 Express app (:3200)                  │
+                 │                                                      │
+  browser ──────►│  public/  (offline SPA: login, upload, chat, ratings)│
+   client        │      │                                               │
+                 │      ▼                                               │
+                 │  routes/  auth · docs · chat · admin · health        │
+                 │      │        (zod validation, multer, JWT guards)   │
+                 │      ▼                                               │
+                 │  services/chat.ts  ── usage gate · cache · logging   │
+                 │      │                                               │
+                 │      ├──► ingest/  extract → chunk → embed → SQL     │
+                 │      └──► retrieval/search.ts  hybrid + RRF          │
+                 │              │                                       │
+                 │              ▼                                       │
+                 │        answer/ extractive.ts | llm.ts                │
+                 └───────────────┬──────────────────────────────────────┘
+                                 ▼
+                 ┌──────────────────────────────────────────────────────┐
+                 │        PostgreSQL 16 + pgvector  (:5434 → :5432)     │
+                 │  users · doc_sets · documents · chunks               │
+                 │  (embedding vector(1536), tsv tsvector)              │
+                 │  answer_cache · usage_counters · chat_logs · feedback│
+                 └──────────────────────────────────────────────────────┘
 ```
 
-Everything runs in two containers (`app`, `postgres`) with a health-gated startup order.
-No external network dependency at runtime.
+Two containers (`app`, `postgres`) with a health-gated start order. No runtime
+dependency on any external service. Embeddings and answers are produced locally
+unless configuration says otherwise; an **optional** self-hosted GPU inference
+sidecar (nested in `gpu-inference/`, started via the compose profiles `gpu` /
+`gpu-cpu`) can serve both embeddings and generative answers, and
+`OPENAI_API_KEY` can serve both from the cloud. Priority at runtime:
+**GPU → OpenAI → offline extractive**.
 
 ---
 
 ## 2. Ingest path
 
 ```
-POST /documents (multipart)
-   │  validate (zod): pdf|docx|txt|md, size ≤ 25 MB, ≤ 10 files
+POST /api/docs   (multipart, field "files", ≤10 files, ≤ UPLOAD_MAX_MB each)
+   │
+   ├─ multer memory storage; extension check → pdf | docx | txt | md
+   ├─ INSERT doc_sets (owner_id = caller)              ← set is created first
+   │
+   │  for each file (each in its own transaction):
    ▼
 extract.ts
-   pdf  → pdfjs-dist legacy build, getTextContent() per page   → [{page, text}]
-   docx → mammoth raw text, split every 50 lines               → [{page, text}]
-   txt/md → split every 50 lines                               → [{page, text}]
+   pdf   → pdfjs-dist legacy build; getTextContent() per page  → [{page, text}]
+   docx  → mammoth raw text, blank-line separated            → [{page: 1, text}]
+   txt/md→ utf-8 text                                        → [{page: 1, text}]
+   │
    ▼
-chunk.ts  — sliding window over the *page-joined* text
-   window = 1200 chars, overlap = 200 chars
-   window end snapped backward to a paragraph break (\n\n ≤ 120 chars away),
-           else to a sentence end ( . ! ? : ; … " ), else to a word boundary
-   window start snapped forward to a word boundary (never mid-word)
-   → { content, page, startOffset } with page carried from the offset map
+chunk.ts
+   PDF: sliding window per real page (exact page numbers)
+   single-blob files: window over the whole text, page = line/50 + 1 (approximate)
+     • window 1200 chars, step 1000 (200 overlap)
+     • right edge snaps back to "\n\n" (≤120 chars), else sentence end,
+       else forward ≤120 chars to a sentence end, else word boundary
+     • overlap start snapped forward to a word boundary
+     • chunks < 20 chars dropped
+   │
    ▼
-embeddings/hashing.ts — 1536-d signed feature hashing
-   tokens (lowercase, stopwords removed, light suffix normalization)
-   features: unigram w=1.0, bigram w=0.7 → index → L2-normalize
+embeddings/  (provider chosen at runtime: GPU > OpenAI > hashing)
+   hashing  → signed FNV-1a feature hashing, unigram 1.0 / bigram 0.7,
+              stopwords removed, suffix-normalized, L2-normalized, 1536-d
+   gpu      → POST {GPU_INFERENCE_URL}/v1/embeddings (all-MiniLM-L6-v2, 384-d),
+              mapped to 1536-d by a deterministic signed random projection
+              (seeded PRNG, re-normalized) so ingest and query spaces match
+   openai   → text-embedding-3-small (1536-d) — only when OPENAI_API_KEY is set
+   │
    ▼
-INSERT INTO chunks (document_id, org_id, user_id, content, page, embedding …)
+INSERT INTO documents (...); INSERT INTO chunks (...)   in one transaction
+   ▼
+201 { setId, name, files: [{ fileId, name, pages, chunks }] }
 ```
 
-Design notes:
+Failure handling: if any file in the request fails to ingest, the whole set is
+deleted so clients never see a partially populated set.
 
-- **Page tracking.** Text is concatenated across pages while recording character offsets,
-  so every chunk knows the page it started on. For PDFs this is exact; for DOCX/TXT/MD
-  pages are *approximate* (50 lines ≈ one page) — the extraction mode and whether pages
-  are exact are stored on the document row and surfaced by `GET /documents/:id`.
-- **Sentence-aware chunking** keeps answers quotable: no chunk begins mid-sentence, which
-  matters because extractive answers quote whole sentences from chunk text.
-- **Offline embeddings.** Without an API key we use signed FNV-1a feature hashing
-  (`EMBEDDING_PROVIDER=hashing`): deterministic, dependency-free, 1536-d to match the
-  production dimension. It captures lexical overlap (unigram + bigram weights), i.e. it is
-  a *lexical* retriever, not a semantic one — honest limitation, quantified in
-  `docs/EVALUATION.md`. `EMBEDDING_PROVIDER=openai` swaps in `text-embedding-3-small`
-  when `OPENAI_API_KEY` is present; dimension must stay 1536 because the column is
-  `vector(1536)`.
+### Why chunking is sentence-aware
+
+The extractive answer stage quotes **whole sentences** from chunk text. A naive
+fixed-width window slices sentences in half, producing answers that start
+mid-clause. The end-of-window search therefore prefers a paragraph break, then a
+sentence terminator, and is allowed to look *forward* up to 120 characters to
+close a sentence rather than cut it.
+
+### Why pages are approximate for txt/md/docx
+
+Those formats carry no page geometry. Splitting them into 50-line pseudo-pages
+keeps the citation shape uniform (`file + page`) while being honest about the
+approximation, which is stated in `docs/EVALUATION.md` metric definitions and
+visible in the API responses. PDFs — the format that matters for real documents —
+use real page numbers because chunking runs per page.
 
 ---
 
-## 3. Storage schema (migration 001)
+## 3. Database schema
 
-| Table | Purpose | Notable columns |
+Created idempotently at startup by `src/db/migrate.ts` (all statements
+`IF NOT EXISTS`, plus `CREATE EXTENSION IF NOT EXISTS vector`).
+
+| Table | Key columns | Notes |
 | --- | --- | --- |
-| `users` | accounts | `email UNIQUE`, `password_hash` (scrypt), `role` (`user`/`admin`) |
-| `documents` | uploaded files (per-user private) | `owner_id`, `pages`, `chunk_count`, `extract_kind`, `pages_exact` |
-| `chunks` | retrieval units | `content`, `page`, `embedding vector(1536)` + **HNSW** (cosine), `tsv tsvector` + GIN |
-| `answer_cache` | normalized answers | `question_hash` (sha256, **unique per user**), `question`, `answer`, `answer_mode`, `citations jsonb`, `hit_count` |
-| `usage_counters` | daily query quota | PK `(user_id, day)` — the uniqueness makes the limit check **atomic** |
-| `answer_feedback` | thumbs | one row per user+answer, upserted |
+| `users` | `id uuid PK`, `email text UNIQUE`, `password_hash`, `created_at` | scrypt hashes; email lowercased on write |
+| `doc_sets` | `id uuid PK`, `owner_id → users`, `name` | the privacy boundary; every query is scoped by it |
+| `documents` | `id uuid PK`, `set_id → doc_sets`, `file_name`, `ext`, `mime`, `pages` | one row per uploaded file |
+| `chunks` | `id bigserial PK`, `doc_id`, `set_id`, `idx`, `page`, `content`, `tsv`, `embedding vector(1536)` | `tsv` is `GENERATED ALWAYS AS (to_tsvector('english', content)) STORED` |
+| `answer_cache` | `PK (set_id, qhash)`, `question`, `answer`, `citations jsonb`, `answer_mode`, `hits`, `created_at` | one row per distinct question per set; `answer_mode` ∈ extractive \| llm \| gpu |
+| `usage_counters` | `PK (user_id, day)`, `queries` | the composite key makes the quota check atomic |
+| `chat_logs` | `id uuid PK`, `user_id`, `set_id`, `question`, `answer`, `answer_mode`, `latency_ms`, `cached`, `created_at` | history + feedback target |
+| `feedback` | `chat_id PK → chat_logs`, `user_id`, `thumbs CHECK (thumbs IN (-1, 1))`, `created_at` | one rating per chat row |
 
-`org_id` columns exist on `documents`/`chunks` for future multi-tenancy; today the
-ownership filter is `user_id` (see §6).
+Indexes:
 
-Embedding index: **HNSW** (`vector_cosine_ops`) — better recall/latency trade-off than IVFFlat
-for a dataset that grows after index creation. Keyword index: GIN over `tsv`.
+```sql
+idx_chunks_set  ON chunks(set_id)                             -- set scoping
+idx_chunks_doc  ON chunks(doc_id)                             -- per-file queries
+idx_chunks_tsv  ON chunks USING gin(tsv)                      -- full-text channel
+idx_chunks_emb  ON chunks USING hnsw (embedding vector_cosine_ops)  -- vector channel
+idx_chat_logs_user ON chat_logs(user_id, created_at DESC)     -- history
+```
+
+**HNSW rather than IVFFlat:** HNSW has no training step and degrades gracefully
+when rows are inserted after index creation — the normal case here, since a set
+is populated by the upload that immediately precedes the first query.
+
+**Generated `tsvector` rather than a trigger:** `to_tsvector('english', content)`
+can never drift out of sync with `content`, and `'english'` also gives stemming
+plus a stopword list for free.
 
 ---
 
 ## 4. Query path
 
+`POST /api/chat { setId, question }` → `services/chat.ts:answerQuestion()`
+
 ```
-POST /chat { question, documentIds?, topK=4 }
-   │
-   ├─ auth guard (JWT) → user id + role
-   ├─ zod validation (question 3..1000 chars)
-   ├─ atomic daily-limit check:  INSERT … ON CONFLICT DO UPDATE
-   │      WHERE used < limit  RETURNING used   → 429 daily_limit_exceeded
-   ├─ cache lookup: sha256(normalized question) unique per user
-   │      found → return with cached:true, hit_count++   (no embedding work)
-   ▼
-retrieval/search.ts
-   qVec = embed(question)                       (hashing or openai)
-   A = top 40 BY embedding <=> qVec             (pgvector cosine)
-   B = top 40 BY ts_rank(tsv, query)            (Postgres full-text)
-   fused = RRF(A, B)  →  take topK
-   ▼
-answer
-   extractive → score sentences of fused chunks (§5)
-   llm        → OpenAI chat over fused chunks (only if OPENAI_API_KEY)
-   ▼
-upsert answer_cache (hit_count = 1), insert chat + chat_messages, return JSON
+1. Ownership check      SELECT owner_id FROM doc_sets WHERE id = $1
+                        not found → 404 ; owner_id ≠ caller → 403
+2. Usage gate           atomic INSERT … ON CONFLICT DO UPDATE
+                        WHERE usage_counters.queries < limit RETURNING queries
+                        no row updated → 429 daily_limit_exceeded
+3. Cache probe          UPDATE answer_cache SET hits = hits + 1
+                        WHERE set_id = $1 AND qhash = $2 RETURNING …
+                        hit → return cached:true (+hit count), log chat row, done
+4. Embed question       one vector, 1536-d
+5. Hybrid search        vector channel + full-text channel → RRF → top 8
+6. Answer               extractive always available; generative branch when
+                        `answerMode()` is `"llm"` (OpenAI) or `"gpu"` (sidecar)
+7. Persist              INSERT … ON CONFLICT (set_id, qhash) DO UPDATE hits+1
+                        INSERT chat_logs RETURNING id
 ```
+
+Ordering matters: the usage counter increments for **every** request including
+cache hits, so caching cannot be used to bypass the daily quota, and the quota
+check happens before any embedding or search work.
 
 ### Reciprocal Rank Fusion
 
 ```
-score(chunk) = Σ_lists  1 / (k + rank_list(chunk))      k = 60
+vecTop   = 100 chunks ORDER BY embedding <=> qvec          (cosine distance asc)
+ftsTop   = 100 chunks WHERE tsv @@ query ORDER BY ts_rank DESC
+
+fused(c) =  1/(k + rankA(c))  +  1/(k + rankB(c))          k = 60, missing ⇒ 0
+fused    =  min(fused / (2/(k+1)), 1)                      normalized to (0, 1]
 ```
 
-RRF ignores the absolute scale of each list (cosine ~0–1 vs ts_rank ~1e-4), so neither
-signal dominates by magnitude — only by *rank*. A chunk retrieved at rank 1 by either
-searcher scores `1/61 ≈ 0.0164`; a chunk ranked 40th by both scores `2/100 = 0.0200`,
-so agreement across signals beats a single strong signal at low rank only when ranks are
-close — in practice top hits from either list survive fusion, which is exactly the desired
-recall behaviour for mixed paraphrase/exact-match questions.
+Ranking is done per channel and only **ranks** are combined. That is the point of
+RRF: cosine similarity lives in `0..1` while `ts_rank` is a small float, so any
+weighted sum of raw scores needs per-query normalization and still breaks when a
+channel returns nothing. With RRF a chunk ranked #1 by either channel scores
+`1/61 ≈ 0.0164`, and agreement across both channels is rewarded
+(`2/61 ≈ 0.0328`). The returned `fused` value is normalized so 1.0 means "rank 1
+in both channels", which is what shows up as `score` in citations.
 
-`documentIds` narrows both searches to a subset (`ANY($3)`) before fusion — filtering
-happens in SQL, not after, so topK remains meaningful.
+Set scoping happens **inside both SQL queries** (`WHERE c.set_id = $2`) before any
+ranking, so `topK` is meaningful and cross-set leakage is impossible at this layer.
 
----
-
-## 5. Answer synthesis (extractive mode)
-
-1. Take fused chunks in order; split into sentences (regex splitter aware of
-   abbreviations, decimals, and quotes).
-2. Score each sentence:
-   `score = 0.65 · queryCoverage + 0.35 · (chunkRankBonus) (+0.05 if it contains a number)`
-   where coverage = (matched query tokens, stopwords removed) / distinct query tokens,
-   and `chunkRankBonus = (topK − chunkRank) / topK` — higher-ranked chunks win ties.
-3. Keep sentences with **≥ 1 matched token** (a stricter ≥ 2 gate measurably hurt
-   recall: answer Hit@3 fell 95.3% → 90.0% in evaluation, so it was rejected).
-4. Order selected sentences by *chunk rank* (not by score) so the narrative follows the
-   document's own ordering, take the top 4 by relevance first, dedupe by content.
-5. Append `[source: file, p.N]` markers and map each contributing sentence back to a
-   citation object `{ document, page, snippet, score }`.
-
-Retrieval-level evaluation (Hit@3, page accuracy) counts a hit when a gold page appears in
-the **first** retrieval results, independent of sentence selection — that separation is why
-both numbers are reported in `docs/EVALUATION.md`.
+Ties are effectively broken by the sort on the summed score: a chunk that only
+appears in one channel carries a single smaller term and sorts below chunks that
+appear in both.
 
 ---
 
-## 6. Multi-tenancy, auth, limits
+## 5. Answer synthesis
 
-- **Registration** creates `role: 'user'`; the first registered account is promoted to
-  `admin` (bootstrap, mirrors the demo flow). scrypt (N=16384) hashes passwords with
-  per-user random salts; JWT (HS256, 12 h) carries `{ sub, role }`.
-- Every documents/chats query filters by `owner_id` / `user_id` from the token — never
-  from the request body. `documentIds` in a chat request are re-checked against ownership;
-  foreign or unknown ids → `403 foreign_document`, so probing other users' ids is refused.
-- **Rate limit**: `MAX_QUERIES_PER_DAY` (default 100). The gate runs *before* embedding
-  work inside `withUsageSlot`, which wraps cache lookup + retrieval + cache insert —
-  concurrent requests cannot slip past the quota. Exceeding → `429 daily_limit_exceeded`
-  with the configured limit echoed in the message.
-- **Admin aggregation**: `GET /admin/feedback` joins feedback → chats → documents to
-  return totals, up/down rates, and the documents with the most negative feedback;
-  `requireRole('admin')` guards both admin routes (403 for regular users).
+### Extractive (default, offline) — `src/answer/extractive.ts`
+
+1. Take the top 3 fused chunks. Split each into candidate sentences: paragraph
+   breaks first (so headings separate from prose), then `(?<=[.!?])\s+`, keeping
+   sentences of 30–500 characters, stripping markdown bullet/heading decoration.
+2. Skip a chunk's first segment when it starts lowercase — that is an overlap
+   fragment continuing the previous chunk, and it reads badly as an answer.
+3. Score each sentence:
+
+   ```
+   coverage = |query tokens ∩ sentence tokens| / |query tokens|
+   score    = coverage
+            + (hits.length − hit.rank) × 0.03      -- prefer higher-ranked chunks
+            − (len > 320 ? 0.08 : 0)               -- discourage over-long sentences
+   ```
+
+4. Keep sentences with `coverage > 0` (at least one shared token), deduplicate by
+   the first 80 lowercase characters, sort by score and take the top 4.
+5. Emit them as a bulleted list under a fixed lead-in, each with
+   `[source: file, p.N]`. Citations are built from the chunk metadata
+   (`fileId, fileName, page, snippet ≤240 chars, score = fused`), up to 5.
+6. If nothing matched, quote the highest-ranked chunk's sentences anyway rather
+   than returning an empty answer; if retrieval returned no chunks at all, return
+   an explicit "no relevant passages" message with an empty citation list.
+
+The ≥1-token gate is deliberate. A stricter "≥2 shared tokens" filter was tried and
+**rejected**: it dropped Retrieval Hit@3 from 95.3 % to 90.0 % in evaluation, because
+many gold facts are carried by a single distinctive term. Scoring — not gating —
+handles precision, and the rank bonus orders what survives.
+
+### LLM (opt-in) — `src/answer/llm.ts`
+
+When `OPENAI_API_KEY` is set and no GPU URL is configured, `answerMode()`
+returns `"llm"` and the fused chunks are passed to `gpt-4o-mini` as grounding
+context. If the API call throws, the code catches it and returns the extractive
+answer with an explicit note that generative mode was unavailable — the request
+still succeeds and the user is told the truth about how the answer was produced.
+
+### GPU (opt-in) — `src/answer/llmLocal.ts`
+
+When `GPU_INFERENCE_URL` is set (highest priority), `answerMode()` returns
+`"gpu"` and the same grounded prompt is sent to the self-hosted sidecar's
+`/v1/chat/completions` (a local instruct model — see `gpu-inference/`). The
+sidecar not being reachable degrades exactly like an OpenAI failure: quoted
+extractive answer plus a visible note, never a fabricated "GPU answer".
+
+`answer_mode` is recorded per cache row and per chat log in all three modes, so
+a mixed history stays self-describing, and a cached row always returns the mode
+it was generated with.
+
+---
+
+## 6. Auth, isolation and quotas
+
+- **Passwords:** `node:crypto` `scrypt` with a random per-user salt, verified with
+  `timingSafeEqual`. No native module, so the image stays small and portable.
+- **Tokens:** HS256 JWT, `{ sub, email, isAdmin }`, 12-hour expiry, signed with
+  `JWT_SECRET`. `requireAuth` attaches `req.user`; `requireAdmin` additionally
+  requires the token's email to equal `ADMIN_EMAIL`.
+- **Isolation:** ownership is resolved from the token's user id in SQL
+  (`WHERE owner_id = $1`), never from a request parameter. Reading, deleting or
+  querying someone else's set returns **403**; an unknown id returns 404. Sets are
+  per-user by construction, so there is no listing route that can leak another
+  user's data.
+- **Quota:** `MAX_QUERIES_PER_DAY` (default 100), enforced by
+  `usage_counters (user_id, day)` with a single conditional upsert. Because the
+  conflict target is the primary key and the `WHERE` clause guards the increment,
+  concurrent requests cannot both consume the same slot; the loser gets zero rows
+  back and becomes a 429. The counter is per UTC day.
 
 ---
 
 ## 7. Caching
 
-`answer_cache` is keyed by `(user_id, sha256(normalize(question)))`:
+Cache key: `(set_id, qhash)` where
+`qhash = sha256(normalizeQuestion(question))` and normalization lowercases,
+collapses whitespace and trims — so `"What  is Everest?"`, `"what is everest?"`
+and trailing-space variants share an entry.
 
-- **Normalize**: lowercase + collapse whitespace → `"What  is the capital"`,
-  `"what is the capital"`, and trailing whitespace share one entry.
-- **Cross-request reuse**: a repeat returns `cached: true` with the original answer and
-  increments `hit_count` (single-statement `UPDATE … RETURNING`), while a fresh answer
-  inserts with `hit_count = 1`. Both code paths converge on one `INSERT … ON CONFLICT`.
-- Cached answers keep their `answer_mode`, so an extractive answer is never relabelled.
-- Redis is on the roadmap; today Postgres *is* the cache and it is measured in the demo
-  (repeat read is faster and `hit_count` visibly increments).
+- Read path is an `UPDATE … RETURNING`: hit → `cached: true`, `hits` incremented,
+  no embedding and no search performed (measurably faster — 3 ms vs 9 ms in the
+  demo run).
+- Write path is `INSERT … ON CONFLICT (set_id, qhash) DO UPDATE SET hits = hits + 1`,
+  which both stores a new answer and tolerates a concurrent duplicate insert.
+- Stored with the answer are its `citations` (jsonb) and `answer_mode`, so a cached
+  extractive answer is never later returned as an LLM answer.
+- Deleting a set cascades to its cache rows (FK `ON DELETE CASCADE`), so stale
+  answers cannot outlive their documents.
+
+Postgres *is* the cache today. A Redis tier is listed in the roadmap; it would add
+a faster shared layer, not missing behaviour.
 
 ---
 
-## 8. Error model & observability
+## 8. Error handling and observability
 
-- Consistent JSON: `{ error: <machine_code>, message: <human text> }` with proper status
-  codes (400 validation, 401 auth, 403 ownership/role, 404, 409 duplicate, 413 too large,
-  415 bad type, 429 limit, 503 db down).
-- `GET /healthz` — process liveness. `GET /readyz` — runs a real `SELECT 1` against the
-  pool; Docker healthcheck and `depends_on: service_healthy` gate startup on it.
-- pino JSON logs with request ids; every chat response carries `latencyMs`.
+- Every failure funnels through one Express error handler and is rendered as
+  `{ error, message, details? }`. `HttpError` carries an explicit code; zod errors
+  become `validation_error` with per-field details; `MulterError`
+  `LIMIT_FILE_SIZE` becomes **413**, other multer errors **400**.
+- Status codes in use: 400, 401, 403, 404, 409, 413, 429, 500, 503.
+- `GET /healthz` is pure liveness. `GET /readyz` runs `SELECT 1` and returns 503
+  when the database is unreachable — this is what the container healthcheck calls,
+  and what `depends_on: service_healthy` waits on.
+- pino logs one JSON line per request (method, path, status, duration) and
+  structured logs for startup/migration retries.
+- `GET /api/config` exposes the active `answerMode`, embedding provider and limits
+  so the UI (and a reviewer) can confirm which mode is live.
 
 ---
 
 ## 9. Deployment
 
-Multi-stage `Dockerfile`:
+**Dockerfile** (multi-stage):
 
-1. `deps` — `npm ci`
-2. `build` — `tsc` → `dist/`
-3. `prod` — production deps only, `USER node` (non-root), `NODE_ENV=production`,
-   `EXPOSE 3200`, `HEALTHCHECK` on `/healthz`
+1. `deps` — `npm ci` from the committed `package-lock.json`.
+2. `build` — `npm run build` (`tsc`) → `dist/`.
+3. `prod` — production dependencies only, `NODE_ENV=production`, **`USER node`**
+   (non-root), `EXPOSE 3200`, and a `HEALTHCHECK` that fetches `/readyz`; the
+   container command is `node dist/src/index.js`.
 
-`docker-compose.yml` starts `postgres` (`pgvector/pgvector:pg16`, volume, healthcheck on
-`pg_isready`) and `app` (`build: .`, `depends_on: service_healthy`, ports `3200:3200`,
-`5434:5432`, env for `JWT_SECRET`, `MAX_QUERIES_PER_DAY`, optional `OPENAI_API_KEY`).
-Migrations run automatically at startup (`runMigrations()` before `listen`), idempotently
-guarded by `schema_migrations`.
+**docker-compose.yml:**
+
+- `postgres`: image `pgvector/pgvector:pg16`, named volume for data,
+  `pg_isready` healthcheck, host port **5434** → container 5432.
+- `app`: built from the local Dockerfile, `depends_on: postgres: { condition:
+  service_healthy }`, host port **3200** → container 3200, environment for
+  `DATABASE_URL` (pointing at the `postgres` service), `JWT_SECRET`,
+  `ADMIN_EMAIL`, `MAX_QUERIES_PER_DAY`, `UPLOAD_MAX_MB` and the optional
+  `OPENAI_*` / `GPU_*` variables.
+- `gpu` / `gpu-cpu`: optional profiles (see `gpu-inference/`) building the
+  sidecar image; `gpu` reserves the NVIDIA device and publishes host port
+  **8100**, `gpu-cpu` runs the same image without a device on **8101**. Both
+  mount the pinned `gpu-inference_hf_models` volume holding the HuggingFace
+  model cache, so neither profile re-downloads weights after the first boot.
+  With no `GPU_INFERENCE_URL` set the app stays in offline extractive mode
+  whether the profiles run or not.
+
+Migrations run at process start (`migrateWithRetry`, 20 attempts × 1.5 s) so host
+runs work even if Postgres is still starting; under compose the healthcheck
+normally means the first attempt already succeeds.
+
+---
+
+## 10. Roadmap (not implemented)
+
+Called out explicitly so the architecture is not over-read:
+
+- **OCR (tesseract)** for scanned PDFs/images — extraction requires a text layer.
+- **Redis answer cache** — the cache is Postgres-backed today.
+- **Semantic retrieval by default** — the semantic paths (OpenAI, local GPU
+  sidecar) are implemented but opt-in; the default path is offline and lexical
+  by design.
+
+No stubs, flags or dead code paths exist for these; they are future work.

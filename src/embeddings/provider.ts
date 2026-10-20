@@ -1,15 +1,17 @@
 /**
  * Embedding provider interface.
  *
- * Two implementations exist behind this interface:
+ * Three implementations exist behind this interface:
  *   1. HashingEmbeddingProvider - deterministic feature hashing, fully offline.
  *   2. OpenAIEmbeddingProvider  - text-embedding-3-small via the OpenAI REST API.
+ *   3. GpuEmbeddingProvider     - self-hosted sidecar (all-MiniLM-L6-v2), 384-d
+ *                                 vectors deterministically projected to 1536-d.
  *
- * Both emit exactly 1536-dimension, L2-normalized vectors so they are
+ * All emit exactly 1536-dimension, L2-normalized vectors so they are
  * interchangeable in the vector(1536) pgvector columns.
  */
 export interface EmbeddingProvider {
-  readonly name: "hashing" | "openai";
+  readonly name: "hashing" | "openai" | "gpu";
   embedTexts(texts: string[]): Promise<number[][]>;
 }
 

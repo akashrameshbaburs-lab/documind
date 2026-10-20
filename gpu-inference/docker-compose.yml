@@ -1,0 +1,44 @@
+services:
+  # GPU mode (default): RTX 3070 via the nvidia container runtime.
+  inference:
+    build: .
+    container_name: gpu-inference
+    ports:
+      - "8100:8000"
+    environment:
+      DEVICE: auto
+      HF_HOME: /models
+      EMBED_MODEL_ID: sentence-transformers/all-MiniLM-L6-v2
+      LLM_MODEL_ID: Qwen/Qwen2.5-1.5B-Instruct
+      MAX_NEW_TOKENS: "256"
+    volumes:
+      - hf_models:/models   # persisted model cache: rebuild-free restarts
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # CPU fallback: same image, no GPU reservation.
+  #   docker compose --profile cpu up inference-cpu
+  inference-cpu:
+    build: .
+    container_name: gpu-inference-cpu
+    profiles: ["cpu"]
+    ports:
+      - "8101:8000"
+    environment:
+      DEVICE: cpu
+      HF_HOME: /models
+      EMBED_MODEL_ID: sentence-transformers/all-MiniLM-L6-v2
+      LLM_MODEL_ID: Qwen/Qwen2.5-1.5B-Instruct
+      MAX_NEW_TOKENS: "256"
+    volumes:
+      - hf_models:/models
+    restart: unless-stopped
+
+volumes:
+  hf_models:

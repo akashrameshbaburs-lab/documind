@@ -16,6 +16,10 @@ const envSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_EMBEDDING_MODEL: z.string().default("text-embedding-3-small"),
   OPENAI_CHAT_MODEL: z.string().default("gpt-4o-mini"),
+  // Self-hosted GPU inference sidecar (OpenAI-compatible). When set, DocuMind
+  // uses local GPU embeddings + a local generative model instead of OpenAI.
+  GPU_INFERENCE_URL: z.string().optional(),
+  GPU_CHAT_MODEL: z.string().default("Qwen/Qwen2.5-1.5B-Instruct"),
 });
 
 export type AppConfig = z.infer<typeof envSchema>;
@@ -28,8 +32,18 @@ export const EMBEDDING_DIM = 1536;
 /** True when an OpenAI key is configured; drives embeddings + generative answers. */
 export const llmEnabled = (): boolean => Boolean(config.OPENAI_API_KEY && config.OPENAI_API_KEY.length > 0);
 
-export type AnswerMode = "llm" | "extractive";
+/** True when the local GPU inference sidecar is configured. */
+export const gpuEnabled = (): boolean => Boolean(config.GPU_INFERENCE_URL && config.GPU_INFERENCE_URL.length > 0);
 
-export const answerMode = (): AnswerMode => (llmEnabled() ? "llm" : "extractive");
+export type AnswerMode = "llm" | "extractive" | "gpu";
 
-export const embeddingProviderName = (): "openai" | "hashing" => (llmEnabled() ? "openai" : "hashing");
+/**
+ * Provider selection, in priority order:
+ *   1. GPU  - local self-hosted inference (no API cost, data stays on-machine)
+ *   2. LLM  - OpenAI when an API key is present
+ *   3. Extractive - fully offline deterministic fallback
+ */
+export const answerMode = (): AnswerMode => (gpuEnabled() ? "gpu" : llmEnabled() ? "llm" : "extractive");
+
+export const embeddingProviderName = (): "openai" | "gpu" | "hashing" =>
+  gpuEnabled() ? "gpu" : llmEnabled() ? "openai" : "hashing";

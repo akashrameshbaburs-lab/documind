@@ -1,0 +1,8 @@
+# torch + cudnn come from the base image (pytorch/pytorch:*-cuda12.4-runtime)
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+transformers==4.46.3
+sentence-transformers==3.3.1
+accelerate==1.1.1
+numpy==1.26.4

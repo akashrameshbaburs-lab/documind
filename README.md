@@ -1,51 +1,69 @@
 # DocuMind AI — Document Q&A Platform (RAG)
 
-Upload documents, ask questions in natural language, get **grounded answers with citations**
-(page numbers, snippet, score) — running **fully offline** out of the box.
+Upload documents into a private **document set**, ask questions in natural language,
+and get **answers with citations** (file, page, snippet, fused score) —
+running **fully offline** out of the box, with no API key and no network calls.
 
-DocuMind is a retrieval-augmented generation (RAG) service with a REST API and a browser UI.
-It extracts text from PDF/DOCX/TXT/Markdown, chunks it, embeds it into Postgres + pgvector,
-and answers questions by fusing **vector similarity** with **keyword (BM25-style) search**.
+DocuMind is a retrieval-augmented generation (RAG) service with a REST API and a
+browser UI. It extracts text from PDF/DOCX/TXT/Markdown, chunks it, embeds it into
+Postgres + pgvector, and answers questions by **fusing vector similarity with
+Postgres full-text search**. Every answer reports the mode that produced it
+(`answerMode`), so a quoted extractive answer is never presented as "AI-generated".
+Three answer modes exist, selected by configuration at runtime, in priority order:
 
-When no LLM API key is configured it runs in **extractive mode** — answers are built from the
-most relevant sentences of your own documents. When `OPENAI_API_KEY` is set, the same retrieval
-pipeline feeds an LLM for generative answers. The response always reports which mode produced it
-(`answerMode: "extractive" | "llm"`), so nothing is ever presented as "AI-generated" when it is not.
+1. **`gpu`** — when `GPU_INFERENCE_URL` is set: embeddings and answers come from a
+   self-hosted inference sidecar (see [`gpu-inference/`](gpu-inference/)); data
+   stays on the machine, no API cost. If the sidecar is unreachable the request
+   fails loudly (`502 gpu_unreachable`) instead of silently mixing embedding
+   spaces; only a failed *generation* call falls back to quoted extraction, with
+   a visible note.
+2. **`llm`** — when `OPENAI_API_KEY` is set: OpenAI `text-embedding-3-small` +
+   `gpt-4o-mini` over the same fused chunks; falls back to quoting on failure.
+3. **`extractive`** (default, fully offline): sentences quoted verbatim from the
+   retrieved documents.
+
+Whichever mode ran is always reported in `answerMode`.
 
 ---
 
-## Pipeline at a time
+## Pipeline at a glance
 
 ```
-INGEST
-  PDF/DOCX/TXT/MD ──► extract text (pdfjs-dist / mammoth, per-page)
-        │
-        ▼
-   chunk ~1200 chars / 200 overlap, sentence-aware, page tracked
-        │
-        ▼
-   embed 1536-d ──► pgvector (cosine) + tsvector (lexeme)   [one row per chunk]
-
-QUERY
-  question ──► embed 1536-d
-        │
-        ▼
-   HYBRID RETRIEVE  (top 40 each, Reciprocal Rank Fusion k=60)
-   ┌─────────────────────────────┬──────────────────────────────────┐
-   │ pgvector cosine similarity  │ tsvector keyword rank (BM25-ish) │
-   └──────────────┬──────────────┴────────────────┬─────────────────┘
-                  └──────────► fused ranking ◄────┘
-        │
-        ▼
-   ANSWER (extractive sentences  ──or──  LLM over top chunks)
-        │
-        ▼
-   citations: [{ document, page, snippet, score }]  +  answerMode
+INGEST                                        QUERY
+  upload (pdf/docx/txt/md)                      question
+      │                                             │
+      ▼                                             ▼
+  extract text per page                        embed question (1536-d)
+  (pdfjs-dist / mammoth / plain)                    │
+      │                                             ▼
+      ▼                                    HYBRID RETRIEVAL (inside the set)
+  chunk: 1200 chars, 200 overlap,          ┌──────────────────────────────┐
+  sentence/paragraph-snapped,              │ A) pgvector cosine (`<=>`)   │  100 candidates
+  page attributed                          │ B) ts_rank over tsvector     │  100 candidates
+      │                                    └───────────────┬──────────────┘
+      ▼                                                    ▼
+  embed 1536-d (hashing / OpenAI / GPU sidecar)
+                                       Reciprocal Rank Fusion (k=60)
+      │                                          fused(c) = Σ 1/(k+rank)
+      ▼                                                    │
+  chunks + tsvector + vector  ──►  Postgres ◄──────────────┤
+   (HNSW cosine index, GIN on tsv)                         ▼
+                                              ANSWER (extractive quotes / OpenAI
+                                              / local GPU model — all grounded
+                                              in the same fused chunks)
+                                                           │
+                                                           ▼
+                                              { answer, citations[], answerMode,
+                                                cached, latencyMs }
 ```
 
 ```
-DEPLOY (Docker Compose)
-  app (:3200, non-root, multi-stage)  ──depends_on──►  postgres+pgvector (:5434, healthcheck)
+DEPLOYMENT (Docker Compose)
+  app :3200 (multi-stage, non-root `node`, healthcheck on /readyz)
+     └─ depends_on: service_healthy ─► postgres+pgvector :5434→5432 (healthcheck pg_isready)
+     └─ optional GPU sidecar :8100 (compose profile `gpu`, RTX 3070 via nvidia
+        runtime; or profile `gpu-cpu` on 8101):  GPU_INFERENCE_URL=http://gpu:8000
+        docker compose --profile gpu up -d --build
 ```
 
 ---
@@ -54,175 +72,289 @@ DEPLOY (Docker Compose)
 
 | Layer | Technology |
 | --- | --- |
-| Runtime | Node.js 22, TypeScript (strict, ESM) |
-| API | Express 4, zod validation, pino logging, jsonwebtoken (JWT auth) |
-| Storage | PostgreSQL 16 + **pgvector** (1536-d vectors, cosine), one container |
-| Search | pgvector cosine + `tsvector` rank, fused with **Reciprocal Rank Fusion** (k=60) |
-| PDF / DOCX | `pdfjs-dist` (legacy build) / `mammoth`; TXT + Markdown built in |
-| Embeddings | Offline signed FNV-1a feature hashing (1536-d) — no API key needed |
-| Answers | Extractive sentence scoring (offline) · optional OpenAI chat (`OPENAI_API_KEY`) |
-| UI | Static SPA served by Express (`/`): login/register, upload, chat, feedback |
-| Testing | `demo.ps1` end-to-end suite (34 assertions), `evaluate.ts` retrieval benchmark (50 questions) |
-| Ops | Docker multi-stage, non-root user, healthchecks, `depends_on: service_healthy` |
+| Runtime | Node.js 22, TypeScript (strict, ESM), ts-node for scripts |
+| API | Express 4, zod validation, multer uploads, pino logging, jsonwebtoken (JWT, 12 h) |
+| Storage | PostgreSQL 16 + **pgvector** — one container, one connection pool |
+| Vector index | **HNSW** (`vector_cosine_ops`) on `vector(1536)` |
+| Keyword index | Generated `tsvector` column + **GIN** index, ranked by `ts_rank` |
+| Fusion | **Reciprocal Rank Fusion**, k = 60 (scale-free rank fusion) |
+| PDF / DOCX | `pdfjs-dist` 4.8 (legacy build, lazy import, bundled offline fonts) / `mammoth`; TXT + Markdown natively |
+| Embeddings | Offline **signed FNV-1a feature hashing** (1536-d) · optional OpenAI `text-embedding-3-small` · optional self-hosted GPU sidecar (MiniLM 384-d → deterministic 1536-d projection) |
+| Answers | Extractive sentence scoring (offline) · optional OpenAI `gpt-4o-mini` · optional local instruct model via the sidecar |
+| Auth | `node:crypto` **scrypt** password hashing (no native deps) + JWT |
+| UI | Vanilla HTML/CSS/JS served by Express — no CDN, works offline |
+| Tests | `scripts/demo.ps1` e2e suite (34 assertions) · `scripts/evaluate.ts` 50-question benchmark |
+| Ops | Multi-stage Dockerfile (non-root), compose healthchecks, startup migrations |
 
-**Ports:** app `3200`, postgres `5434` (host) → `5432` (container). Nothing else is used.
+**Ports:** app `3200`, Postgres `5434` (host) → `5432` (container), plus the
+optional sidecar `8100` (profile `gpu`) or `8101` (profile `gpu-cpu`) — nothing
+else is ever bound.
 
 ---
 
 ## Quick start
 
-### Option A — Docker (recommended)
+### Docker (recommended)
 
 ```powershell
 docker compose up --build -d
-# wait for healthy, then:
-.\scripts\demo.ps1            # end-to-end proof: 34 assertions
+docker compose ps                      # wait until both are healthy
+.\scripts\demo.ps1                     # end-to-end proof: 34 assertions
 ```
 
-Open **http://localhost:3200**, register, upload documents, ask questions.
+Then open **http://localhost:3200**, register, upload documents, ask questions.
 
-### Option B — local dev (Postgres in Docker, app on Node)
+Optional local-GPU mode (RTX-class nvidia GPU; model cache persists in the
+pinned `gpu-inference_hf_models` volume):
+
+```powershell
+docker compose --profile gpu up -d --build        # port 8100, DEVICE=auto (cuda)
+docker compose --profile gpu-cpu up -d --build    # port 8101, CPU-only fallback
+$env:GPU_INFERENCE_URL = "http://localhost:8100"  # for host-run `npm run dev`
+# then restart the app so it picks up the URL: docker compose up -d app
+```
+
+### Local development
 
 ```powershell
 docker compose up -d postgres
 npm ci
-Copy-Item .env.example .env   # adjust if needed
+Copy-Item .env.example .env
+npm run generate-samples               # optional: writes eval/docs/world-facts.pdf
 npm run build
-npm run migrate
-npm run dev                   # http://localhost:3200
+npm run dev                            # http://localhost:3200 (migrations run at startup)
 ```
 
-### Seed sample documents (optional)
+### Configuration
 
-```powershell
-npm run generate:samples      # writes eval/docs/world-facts.pdf (PDFKit)
-```
-
-### Environment
-
-Copy `.env.example` to `.env`. Highlights:
+All variables are documented in [`.env.example`](.env.example). Highlights:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PORT` / `DATABASE_URL` | `3200` / local socket | Service + database |
-| `JWT_SECRET` | dev fallback | **Set this in production** |
-| `OPENAI_API_KEY` | *(unset)* | Enables `answerMode: "llm"`; unset = offline extractive |
-| `EMBEDDING_PROVIDER` | `hashing` | `hashing` (offline) or `openai` (1536-d, needs key) |
-| `MAX_QUERIES_PER_DAY` | `100` | Per-user daily question limit → HTTP 429 |
+| `PORT` | `3200` | HTTP port |
+| `DATABASE_URL` | `postgres://documind:documind@localhost:5434/documind` | Database (compose injects the `postgres` host) |
+| `JWT_SECRET` | insecure dev value | **Set a long random value in production** |
+| `ADMIN_EMAIL` | `admin@documind.local` | The account with this email is the admin |
+| `MAX_QUERIES_PER_DAY` | `100` | Per-user daily chat quota → HTTP 429 when exceeded |
+| `UPLOAD_MAX_MB` | `15` | Max size per uploaded file (max 10 files per request) |
+| `OPENAI_API_KEY` | *(unset)* | Set it to switch to `answerMode: "llm"` + OpenAI embeddings |
+| `GPU_INFERENCE_URL` | *(unset)* | Self-hosted sidecar URL (inside compose: `http://gpu:8000`) → `answerMode: "gpu"`; takes priority over the OpenAI key |
+| `GPU_CHAT_MODEL` | `Qwen/Qwen2.5-1.5B-Instruct` | Model label used with the sidecar's chat endpoint |
 
 ---
 
 ## API
 
-All routes except `GET /healthz`, `GET /readyz`, `POST /auth/register`, `POST /auth/login`
-require `Authorization: Bearer <JWT>`.
+All `/api` routes except register/login require `Authorization: Bearer <JWT>`.
+Documents live in a **private set**; every set is owned by exactly one user, and
+access is enforced by ownership at the SQL level (not by request parameters).
 
 | Method & path | Purpose |
 | --- | --- |
-| `GET /healthz` / `GET /readyz` | Liveness / database readiness |
-| `POST /auth/register` · `POST /auth/login` | Create account (role `user`/`admin`), get JWT (12 h) |
-| `GET /me` | Current user + remaining quota |
-| `POST /documents` | Multipart upload (`files`), extract → chunk → embed → store |
-| `GET /documents` · `GET /documents/:id` · `DELETE /documents/:id` | List / inspect / delete own documents |
-| `POST /chat` | `{ question, documentIds?, topK? }` → answer + citations + `answerMode` |
-| `GET /chats` · `GET /chats/:id` | Chat history with cached answers |
-| `POST /chats/:id/feedback` | Thumbs up/down on an answer |
-| `GET /admin/feedback` | Admin-only aggregation (counts, rates, top failing docs) |
-| `GET /admin/usage` · `GET /admin/usage/summary` | Admin-only per-user usage and daily trend |
+| `GET /healthz` | Liveness (process is up) |
+| `GET /readyz` | Readiness — executes a real `SELECT 1` against the pool |
+| `GET /api/config` | Public runtime info: answer mode, embedding provider, limits |
+| `POST /api/register` | Create account → `201 { id, email }`; duplicate → `409` |
+| `POST /api/login` | → `{ token, user: { id, email, isAdmin } }`; bad credentials → `401` |
+| `GET /api/me` | Current user from the token |
+| `POST /api/docs` | Multipart upload, field `files` (≤10, ≤15 MB each), optional `name` → `201 { setId, name, files[] }` |
+| `GET /api/sets` | List **your** sets with file/chunk counts |
+| `GET /api/docs/:setId` | Inspect one owned set and its files |
+| `DELETE /api/docs/:setId` | Delete an owned set (cascades to chunks + cache) |
+| `POST /api/chat` | `{ setId, question }` → `{ id, answer, citations[], answerMode, latencyMs, cached }` |
+| `GET /api/usage` | Today's `{ day, queries, limit, remaining }` for the caller |
+| `GET /api/chat/history/:setId` | Last 25 questions of the caller in that set |
+| `POST /api/chat/:id/feedback` | `{ thumbs: 1 \| -1 }` upsert; invalid value → `400` |
+| `GET /api/admin/feedback` | **Admin only** — totals, up/down ratio, per-set breakdown, recent feedback |
 
-### Example
+Errors are always `{ "error": "<code>", "message": "<human text>", "details"?: ... }`
+(400 validation, 401 auth, 403 ownership/admin, 404 missing, 409 duplicate,
+413 file too large, 429 daily limit).
+
+### Worked example
 
 ```powershell
-$tok = (Invoke-RestMethod http://localhost:3200/auth/login `
-  -Method Post -ContentType application/json `
-  -Body '{"email":"demo@example.com","password":"password123"}').token
+$login = Invoke-RestMethod http://localhost:3200/api/login -Method Post `
+  -ContentType "application/json" `
+  -Body '{"email":"you@example.com","password":"your-password"}'
+$h = @{ Authorization = "Bearer $($login.token)" }
 
-Invoke-RestMethod http://localhost:3200/chat -Method Post `
-  -ContentType "application/json" -Headers @{ Authorization = "Bearer $tok" } `
-  -Body '{"question":"What is the capital of France?","topK":4}'
+# upload one or more files into a new private set
+# (PowerShell 5.1's Invoke-RestMethod has no -Form; use HttpClient for multipart)
+Add-Type -AssemblyName System.Net.Http
+$bytes = [System.IO.File]::ReadAllBytes((Resolve-Path .\eval\docs\world-facts.pdf))
+$mp = New-Object System.Net.Http.MultipartFormDataContent
+$mp.Add((New-Object System.Net.Http.ByteArrayContent($bytes, 0, $bytes.Length)), "files", "world-facts.pdf")
+$cli = New-Object System.Net.Http.HttpClient
+$cli.DefaultRequestHeaders.Authorization = "Bearer $($login.token)"
+$json = $cli.PostAsync("http://localhost:3200/api/docs", $mp).Result.Content.ReadAsStringAsync().Result
+$up = $json | ConvertFrom-Json
+$cli.Dispose(); $mp.Dispose()
+
+# ask a question
+Invoke-RestMethod http://localhost:3200/api/chat -Method Post -Headers $h `
+  -ContentType "application/json" `
+  -Body (@{ setId = $up.setId; question = "Which mountain is the highest above sea level?" } | ConvertTo-Json)
 ```
 
 ```json
 {
-  "answer": "Paris is the capital and largest city of France. [source: world-facts.pdf, p.1]",
-  "answerMode": "extractive",
+  "id": "0f5c…",
+  "answer": "Based on the most relevant passages in your documents:\n\n- Mount Everest is Earth's highest mountain above sea level, rising to 8,849 metres (29,032 feet) on the border between Nepal and the Tibet Autonomous Region of China. [source: world-facts.pdf, p.1]",
   "citations": [
-    { "document": "world-facts.pdf", "page": 1, "snippet": "Paris is the capital and largest city of France…", "score": 0.4521 }
+    {
+      "fileId": "1c2e…",
+      "fileName": "world-facts.pdf",
+      "page": 1,
+      "snippet": "World Facts Handbook - Chapter 1: Physical Geography…",
+      "score": 0.5
+    }
   ],
-  "cached": false,
-  "latencyMs": 5
+  "answerMode": "extractive",
+  "latencyMs": 9,
+  "cached": false
 }
 ```
 
+A second, byte-identical question against the same set returns `"cached": true`
+with a `cacheHits` counter, and does **not** re-run retrieval.
+
 ---
 
-## Two answer modes — honest by design
+## The three answer modes — honest by design
 
-| | **Extractive (default, offline)** | **LLM (`OPENAI_API_KEY` set)** |
-| --- | --- | --- |
-| How | Sentences from your documents scored by query-term coverage + retrieval rank; the best 3–5 are returned in order | OpenAI chat completion over the fused top chunks |
-| Grounding | Every sentence is quoted verbatim from a source chunk → citations are exact | Citations come from retrieved chunk metadata |
-| Needs network / key | **No** — runs 100 % offline | Yes |
-| Reported as | `answerMode: "extractive"` | `answerMode: "llm"` |
+| | **Extractive** (default, offline) | **LLM** (`OPENAI_API_KEY` set) | **GPU** (`GPU_INFERENCE_URL` set) |
+| --- | --- | --- | --- |
+| Answer comes from | Sentences quoted **verbatim** from the top-ranked chunks | `gpt-4o-mini` chat completion over the same fused chunks | Local instruct model on the machine's GPU, same grounding contract |
+| Selection | Query-token coverage + rank bonus; top sentences in document order | Full generative answer, still grounded in retrieved context | Full generative answer with `[source: …]` markers appended by prompt |
+| Citations | Exact — each quoted sentence is tagged `[source: file, p.N]` | Derived from the chunks fed to the model | Derived from the chunks fed to the model |
+| Network / key | **Not required** | OpenAI key required | Local sidecar required (no key, no cost) |
+| Reported as | `answerMode: "extractive"` | `answerMode: "llm"` | `answerMode: "gpu"` |
+| On failure | — | Falls back to the extractive answer with a visible note | Embedding failure fails the request with `502 gpu_unreachable` (vector spaces are never mixed); generation-only failure falls back to the extractive answer with a visible note |
 
-The service never fabricates an "LLM answer" when no LLM ran.
+The service never claims to have used a generative model when it has not.
 
 ### How hybrid retrieval works
 
-Each query is executed twice against the *same* candidate set:
+Each question is searched twice, scoped to the one document set and capped at 100
+candidates per channel:
 
-1. **Vector search** — cosine similarity between the query embedding and chunk embeddings (pgvector).
-2. **Keyword search** — Postgres full-text ranking over the `tsvector` column (lexemes + frequencies).
+1. **Vector channel** — `ORDER BY embedding <=> query_vector` (pgvector cosine
+   distance, HNSW index).
+2. **Full-text channel** — `tsv @@ plainto_tsquery('english', q)` ordered by
+   `ts_rank` (GIN index). This catches exact terms, rare words and numbers that a
+   lexical-hash embedding may under-rank.
 
-Both lists are merged with **Reciprocal Rank Fusion** (RRF), the standard score-agnostic blend:
+The two ranked lists are merged with **Reciprocal Rank Fusion**:
 
 ```
-fused(chunk) = Σ  1 / (k + rank_list(chunk))       k = 60
+fused(c) =  1/(k + rankA(c))  +  1/(k + rankB(c))          k = 60
 ```
 
-Ranks come from each list's own ordering, so a chunk that ranks top-3 in *either* signal
-survives fusion even if the other signal ranks it lower. The top `topK` (default 4) fused
-chunks become the answer's context. This is why DocuMind finds both paraphrases
-("population" ≈ "how many people") and exact terms ("treaty", "3.4%") in one pass.
+then normalized by the theoretical maximum `2/(k+1)` so `fused ∈ (0, 1]`.
+RRF is used because the raw scores are incommensurable — cosine similarity is
+`0..1` while `ts_rank` is a tiny float; ranking each channel independently and
+fusing *ranks only* makes the blend robust, including when one channel returns
+no matches at all. Ties are broken by the channel that ranked the chunk higher.
+
+### Chunking
+
+- Window **1200 characters**, step **1000** (200-character overlap).
+- The right edge snaps backward to a paragraph break, then a sentence end, then a
+  word boundary (searching ≤120 chars); if none is available behind, it may snap
+  *forward* ≤120 chars to finish the sentence. Sentences are never cut in half,
+  which is what makes verbatim quoting possible.
+- The overlap start is snapped forward to a word boundary so no chunk begins mid-word.
+- **Page attribution:** PDFs are chunked per real page, so page numbers are exact.
+  DOCX/TXT/MD have no page geometry, so pages are approximated as **50 lines per
+  page** (documented, and stated in `GET /api/docs/:setId` results by extension).
+
+### Embeddings
+
+The provider is chosen at runtime, in priority order:
+
+1. **gpu** (`GPU_INFERENCE_URL` set) — the sidecar serves
+   `sentence-transformers/all-MiniLM-L6-v2` (384-d). Because the database column
+   is fixed at `vector(1536)`, the vector is mapped through a **deterministic
+   signed random projection** (seeded PRNG, then re-normalized) — the same
+   matrix is rebuilt at query time, so ingest and query spaces always match
+   (Johnson–Lindenstrauss preserves cosine similarity).
+2. **openai** (`OPENAI_API_KEY` set) — `text-embedding-3-small`, native 1536-d.
+3. **hashing** (default, offline) — signed FNV-1a feature hashing over unigrams
+   (weight 1.0) and bigrams (0.7), stopwords removed, light suffix
+   normalization, L2-normalized to 1536 dimensions. Deterministic,
+   dependency-free, network-free — but **lexical, not semantic**.
+
+Every provider emits 1536-d L2-normalized vectors, so the pgvector column type
+never changes. The vectors themselves are **not** comparable across providers,
+however: a set must be queried with the provider it was ingested under. If you
+switch providers, re-upload the documents (embeddings are rebuilt at ingest
+time) so document and query vectors always share one space — the service does
+not silently re-embed old sets.
 
 ---
 
 ## Evaluation
 
-`npm run evaluate` runs a 50-question gold set (`eval/questions.json`) against two generated
-sample documents (`eval/docs/world-facts.pdf`, `eval/docs/field-notes.md`) and writes real
-numbers to [`docs/EVALUATION.md`](docs/EVALUATION.md).
+`npm run evaluate` uploads the two generated sample documents as a set, runs the
+50-question gold set from `eval/questions.json` against the live service, and
+writes measured results to [`docs/EVALUATION.md`](docs/EVALUATION.md) — no
+hand-written numbers.
 
-Latest run (**extractive mode, offline hashing embeddings**):
+Latest run — **extractive mode, `hashing` embeddings (signed FNV-1a, 1536-d)**:
 
 | Metric | Result |
 | --- | --- |
-| Hit@3 (gold document in top 3) | **100.0 %** (50/50) |
-| Page accuracy (correct page in top 3) | **100.0 %** (50/50) |
-| Answer Hit@3 (answer text drawn from gold doc) | **100.0 %** |
-| Keyword coverage (gold keywords present in answer) | **96.0 %** (100 % of questions ≥ 50 %) |
-| Mean latency / p95 | **5 ms / 11 ms** |
-| Cache verification | pass (repeat query served from `answer_cache`) |
+| Retrieval Hit@3 (gold file in top-3 citations) | **100.0 %** (50/50) |
+| Page accuracy (gold file **and** page cited) | **100.0 %** (50/50) |
+| Answer Hit@3 (top-3 citations) | **100.0 %** (50/50) |
+| Keyword coverage (mean share of gold keywords in the answer) | **96.0 %** |
+| Questions with ≥ 50 % keyword coverage | **100.0 %** (50/50) |
+| Mean latency / p50 / p95 | **5 ms / 4 ms / 6 ms** |
+| Cache verified on repeat question | **yes** (`cached: true`) |
+| Estimated API cost | **$0.00** (offline mode) |
 
-The end-to-end suite `.\scripts\demo.ps1` asserts **34** behaviours: auth, upload, chunking,
-chat + citations, answer caching (hit counter + faster second read), feedback + admin
-aggregation, per-user isolation, cross-user 401/403, non-admin 403, and the daily query
-limit (429).
+`scripts/demo.ps1` is the behavioural proof — **34 assertions** covering health and
+readiness, registration/login plus duplicate and bad-credential paths, token
+rejection, multi-file upload (page and chunk counts reported per file), an empty
+upload → 400, chat with citations and `answerMode`, cache hit on a repeat question
+(faster second read + byte-identical answer), thumbs up/down with upsert and
+invalid value → 400, the usage counter, cross-user isolation (403 on read, delete
+and query; user B sees zero sets), non-admin admin route → 403, and admin feedback
+aggregation. `scripts/probe-ratelimit.ts` separately drives asks past
+`MAX_QUERIES_PER_DAY` and exits non-zero unless a real 429 with a JSON body
+appears.
 
 ```powershell
-.\scripts\demo.ps1      # expected: ALL 34 CHECKS PASSED
+.\scripts\demo.ps1        # expected last line: ALL CHECKS PASSED (34 assertions)
 ```
+
+### Reading these numbers honestly
+
+Retrieval scores are high because the corpus is small (2 documents, 15 chunks),
+the gold answers are literal facts, and extractive mode quotes source sentences
+instead of paraphrasing. That is the intended strength of the offline mode, **not
+evidence of general-purpose semantic understanding**: the hashing embedder is
+lexical, so a question phrased with entirely different vocabulary would reduce
+Hit@3. More detail and per-question failure output lives in
+[`docs/EVALUATION.md`](docs/EVALUATION.md).
 
 ---
 
-## Not implemented on purpose (roadmap)
+## Roadmap — deliberately **not** implemented
 
-These are **planned, not present** — no stubs, no pretend features:
+These are planned work, called out so nothing is over-claimed. There are no
+stubbed code paths for them in the repository:
 
-- **OCR for scanned PDFs / images** (tesseract) — extraction currently needs a text layer.
-- **Redis** answer cache — the cache is Postgres-backed today (`answer_cache` table).
-- OpenAI embeddings / LLM answers are implemented but **opt-in** and disabled by default
-  so the whole system runs offline.
+- **OCR for scanned PDFs and images** (e.g. tesseract). Extraction requires a text
+  layer today; a scanned document yields little or no text.
+- **Redis-backed answer cache.** Caching exists and is verified, but it is
+  Postgres-backed (`answer_cache`); Redis would be an additional tier, not a
+  replacement for missing functionality.
+- **Semantic retrieval by default.** Semantic embedding paths exist (OpenAI and
+  the local GPU sidecar) but both are opt-in; the default path is the offline
+  lexical hasher, so a deployment without any sidecar or key still retrieves by
+  vocabulary overlap only.
 
 ---
 
@@ -231,25 +363,50 @@ These are **planned, not present** — no stubs, no pretend features:
 ```
 documind/
 ├─ src/
-│  ├─ index.ts            # Express app + routes
-│  ├─ db/                 # pool, migrations, schema
-│  ├─ auth/               # scrypt hashing, JWT, roles, guards
-│  ├─ ingest/             # extract.ts (pdf/docx/txt/md) + chunk.ts (sentence-aware)
-│  ├─ embeddings/         # hashing.ts (offline 1536-d) + openai.ts (opt-in)
-│  ├─ retrieval/search.ts # hybrid vector+keyword + RRF fusion
-│  ├─ answer/extractive.ts# offline grounded answers
-│  ├─ services/           # documents, chat (cache/limits/feedback)
-│  └─ routes/             # auth, documents, chat, admin, health
-├─ public/                # browser UI (index.html, app.js, styles.css)
-├─ scripts/               # demo.ps1 (e2e), evaluate.ts (benchmark), generate-samples.js
-├─ eval/                  # questions.json (50) + generated sample documents
-├─ docs/                  # ARCHITECTURE.md, EVALUATION.md
-├─ Dockerfile             # multi-stage, non-root
-└─ docker-compose.yml     # app + pgvector, healthchecks, service_healthy
+│  ├─ index.ts              # Express app, route mounting, error handler, startup migrations
+│  ├─ config.ts             # zod-parsed env, EMBEDDING_DIM, answer-mode derivation
+│  ├─ text.ts               # tokenizer, stopwords, light suffix normalization, question normalization
+│  ├─ logger.ts  httpError.ts
+│  ├─ db/pool.ts            # pg pool + withTransaction
+│  ├─ db/migrate.ts         # idempotent schema (users, doc_sets, documents, chunks,
+│  │                        #   answer_cache, usage_counters, chat_logs, feedback) + indexes
+│  ├─ auth/                 # scrypt password.ts, jwt.ts, requireAuth/requireAdmin middleware
+│  ├─ ingest/extract.ts     # pdfjs-dist / mammoth / plain text → page-attributed text
+│  ├─ ingest/chunk.ts       # 1200/200 sliding window, sentence snapping, page attribution
+│  ├─ ingest/ingest.ts      # file → chunks → embeddings → SQL (transactional)
+│  ├─ embeddings/           # provider.ts, hashing.ts (offline), openai.ts,
+│  │                        #   gpu.ts (sidecar + 384→1536 projection), index.ts
+│  ├─ retrieval/search.ts   # hybrid vector + full-text search, RRF fusion
+│  ├─ answer/extractive.ts  # grounded offline answers + citations
+│  ├─ answer/llm.ts         # optional OpenAI answer synthesis
+│  ├─ answer/llmLocal.ts    # optional self-hosted GPU answer synthesis
+│  ├─ services/chat.ts      # ownership check, usage gate, cache, retrieval, logging
+│  └─ routes/               # auth.ts, docs.ts, chat.ts, admin.ts, health.ts
+├─ public/                  # offline browser UI: index.html, app.js, styles.css
+├─ scripts/
+│  ├─ demo.ps1              # 34-assertion end-to-end suite (PowerShell 5.1)
+│  ├─ evaluate.ts           # 50-question benchmark → docs/EVALUATION.md
+│  ├─ generate-samples.js   # PDFKit fixture generator
+│  └─ probe*.ts, inspect-extract.ts   # development verification helpers
+├─ eval/
+│  ├─ questions.json        # 50 gold questions with expected file/page/keywords
+│  └─ docs/                 # world-facts.pdf (generated), field-notes.md
+├─ docs/
+│  ├─ ARCHITECTURE.md       # internals: schema, fusion math, caching, limits
+│  └─ EVALUATION.md         # measured numbers from the latest run
+├─ gpu-inference/           # optional local GPU sidecar (own README + bench)
+│  ├─ app/                  # FastAPI: OpenAI-compatible /v1 endpoints
+│  ├─ scripts/bench.py      # stdlib benchmark → docs/BENCHMARK.md
+│  ├─ Dockerfile            # pytorch/pytorch:2.5.1-cuda12.4 runtime
+│  └─ docker-compose.yml    # standalone mode (compose profile `gpu` is primary)
+├─ Dockerfile               # multi-stage, non-root, /readyz healthcheck
+├─ docker-compose.yml       # app + pgvector/pgvector:pg16 + optional gpu profile
+├─ .env.example
+└─ package.json             # build, start, dev, evaluate, generate-samples, typecheck
 ```
 
 More detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
-Benchmark data: [`docs/EVALUATION.md`](docs/EVALUATION.md)
+Measured results: [`docs/EVALUATION.md`](docs/EVALUATION.md)
 
 ---
 

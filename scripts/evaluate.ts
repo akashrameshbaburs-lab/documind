@@ -20,7 +20,6 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { answerMode, config } from "../src/config";
 import { tokenize } from "../src/text";
 
 const BASE_URL = process.env.DOCUMIND_URL ?? "http://localhost:3200";
@@ -114,7 +113,13 @@ async function main(): Promise<void> {
   const questions: EvalQuestion[] = JSON.parse(fs.readFileSync(questionsPath, "utf-8"));
 
   console.log(`DocuMind AI evaluation - ${BASE_URL}`);
-  console.log(`answerMode=${answerMode()} embedding=${process.env.OPENAI_API_KEY ? "openai" : "hashing"}`);
+  // The authoritative mode/provider comes from the LIVE service (/api/config),
+  // not from this script's own environment — the eval host has no GPU URL set,
+  // so trusting local env would misreport a GPU run as extractive.
+  const runtime = await httpJson<{ answerMode: string; embeddingProvider: string }>("GET", "/api/config");
+  const mode = runtime.answerMode;
+  const embeddingProvider = runtime.embeddingProvider;
+  console.log(`answerMode=${mode} embedding=${embeddingProvider}`);
 
   // 1. Register (ignore conflict if the eval user already exists) and log in.
   await httpJson("POST", "/api/register", { email: EMAIL, password: PASSWORD }).catch(() => undefined);
@@ -200,19 +205,19 @@ async function main(): Promise<void> {
   const cacheHits = rows.filter((r) => r.cached).length;
   const avgAnswerChars = Math.round(totalAnswerChars / (n || 1));
 
-  // 6. Cost estimate (LLM mode only - offline mode makes zero paid API calls).
+  // 6. Cost estimate (LLM mode only - offline/GPU modes make zero paid API calls).
   let costLine: string;
-  if (answerMode() === "llm") {
+  if (mode === "llm") {
     const embTokens = (upload.files.reduce((a, f) => a + f.chunks, 0) * 1200 + n * 20 + avgAnswerChars * n) / 4;
     const est = (embTokens / 1_000_000) * PRICE.embeddingInput + (avgAnswerChars * n * 4 / 1_000_000) * PRICE.chatOutput;
     costLine = `~$${est.toFixed(4)} for this 50-question run (estimated from token counts; not metered)`;
+  } else if (mode === "gpu") {
+    costLine = "**$0.00** — self-hosted GPU inference on this machine's RTX 3070; no paid API calls";
   } else {
     costLine = "**$0.00** — offline extractive mode makes no paid API calls";
   }
 
   const timestamp = new Date().toISOString();
-  const mode = answerMode();
-  const embeddingProvider = process.env.OPENAI_API_KEY ? "openai:text-embedding-3-small" : "hashing:fnv1a-1536";
 
   const report = `# Evaluation Results — DocuMind AI
 
@@ -267,21 +272,30 @@ ${failures.length === 0 ? "None — every question produced a citation pointing 
 
 ## Reading these numbers honestly
 
-- Retrieval and citation accuracy are high because the corpus is small, the gold
-  answers are literal facts, and extractive mode quotes source sentences verbatim
-  instead of paraphrasing. This is the *intended* strength of the offline mode and
+- Retrieval and citation accuracy are high because the corpus is small (2 files,
+  15 chunks), the gold answers are literal facts, and the answer sits close to
+  the retrieved passages. This is the *intended* strength on a closed corpus and
   **not** evidence of general-purpose semantic understanding.
-- The hashing embedder is lexical (unigrams + bigrams + full-text rank fusion), not
-  semantic: a question phrased with entirely different vocabulary would degrade
-  Hit@3. LLM mode (\`OPENAI_API_KEY\` set) uses real semantic embeddings and is
-  expected to be more robust to paraphrase.
+${
+  mode === "gpu"
+    ? "- Embeddings came from `all-MiniLM-L6-v2` on the local GPU (384-d, deterministic\n  signed random projection to 1536-d): genuinely semantic, unlike the default\n  lexical hasher — but a 1.5B instruct model wrote the answers, so phrasing quality\n  is bounded by that model, not by retrieval."
+    : mode === "llm"
+      ? "- Embeddings came from `text-embedding-3-small` (semantic) and answers from\n  `gpt-4o-mini`; paraphrased questions should hold up better than with the default\n  lexical hasher."
+      : "- The hashing embedder is lexical (unigrams + bigrams + full-text rank fusion), not\n  semantic: a question phrased with entirely different vocabulary would degrade\n  Hit@3. LLM mode (`OPENAI_API_KEY` set) or GPU mode (`GPU_INFERENCE_URL` set) use\n  real semantic embeddings and are expected to be more robust to paraphrase."
+}
 - Latency is single-request wall clock on a local Docker Desktop instance with an
-  empty cache and includes the database round trip.
+  empty cache and includes the database round trip${
+    mode === "gpu" ? ", the GPU embedding call and local generation." : "."
+  }
 
 ## How to reproduce
 
 \`\`\`powershell
-docker compose up --build -d
+${
+  mode === "gpu"
+    ? '$env:GPU_INFERENCE_URL = "http://gpu:8000"\ndocker compose --profile gpu up --build -d   # sidecar on :8100 (RTX 3070)'
+    : "docker compose up --build -d"
+}
 npm run evaluate          # writes this file
 \`\`\`
 

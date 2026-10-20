@@ -215,7 +215,7 @@ $ask1 = Invoke-Api -Method POST -Path "/api/chat" -Token $tokenA -Json $askBody
 Assert ($ask1.Status -eq 200) "POST /api/chat -> 200 (got $($ask1.Status))"
 $r1 = $ask1.Json
 Assert ([bool]$r1.answer -and $r1.answer.Length -gt 40) "answer is non-empty ($($r1.answer.Length) chars)"
-Assert ($r1.answerMode -in @("extractive", "llm")) "answerMode present: '$($r1.answerMode)'"
+Assert ($r1.answerMode -in @("extractive", "llm", "gpu")) "answerMode present: '$($r1.answerMode)'"
 $citations = @($r1.citations)
 Assert ($citations.Count -gt 0) "citations returned: $($citations.Count)"
 $withPages = @($citations | Where-Object { $_.page -ge 1 -and $_.fileName })
