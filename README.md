@@ -1,5 +1,7 @@
 # DocuMind AI — Document Q&A Platform (RAG)
 
+![CI](https://github.com/akashrameshbaburs-lab/documind/actions/workflows/ci.yml/badge.svg)
+
 Upload documents into a private **document set**, ask questions in natural language,
 and get **answers with citations** (file, page, snippet, fused score) —
 running **fully offline** out of the box, with no API key and no network calls.
