@@ -293,7 +293,7 @@ ${
 \`\`\`powershell
 ${
   mode === "gpu"
-    ? '$env:GPU_INFERENCE_URL = "http://gpu:8000"\ndocker compose --profile gpu up --build -d   # sidecar on :8100 (RTX 3070)'
+    ? "docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build -d   # sidecar on :8100 (RTX 3070)"
     : "docker compose up --build -d"
 }
 npm run evaluate          # writes this file

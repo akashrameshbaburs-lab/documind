@@ -38,8 +38,8 @@ the *Roadmap* section at the end lists the things that deliberately do not.
 Two containers (`app`, `postgres`) with a health-gated start order. No runtime
 dependency on any external service. Embeddings and answers are produced locally
 unless configuration says otherwise; an **optional** self-hosted GPU inference
-sidecar (nested in `gpu-inference/`, started via the compose profiles `gpu` /
-`gpu-cpu`) can serve both embeddings and generative answers, and
+sidecar (nested in `gpu-inference/`, started with the override file
+`docker-compose.gpu.yml`) can serve both embeddings and generative answers, and
 `OPENAI_API_KEY` can serve both from the cloud. Priority at runtime:
 **GPU → OpenAI → offline extractive**.
 
@@ -326,13 +326,15 @@ a faster shared layer, not missing behaviour.
   `DATABASE_URL` (pointing at the `postgres` service), `JWT_SECRET`,
   `ADMIN_EMAIL`, `MAX_QUERIES_PER_DAY`, `UPLOAD_MAX_MB` and the optional
   `OPENAI_*` / `GPU_*` variables.
-- `gpu` / `gpu-cpu`: optional profiles (see `gpu-inference/`) building the
-  sidecar image; `gpu` reserves the NVIDIA device and publishes host port
-  **8100**, `gpu-cpu` runs the same image without a device on **8101**. Both
-  mount the pinned `gpu-inference_hf_models` volume holding the HuggingFace
-  model cache, so neither profile re-downloads weights after the first boot.
-  With no `GPU_INFERENCE_URL` set the app stays in offline extractive mode
-  whether the profiles run or not.
+- `gpu` (override file `docker-compose.gpu.yml`, see `gpu-inference/`): builds
+  the sidecar image, reserves the NVIDIA device, publishes host port **8100**
+  and — the point of the override pattern — sets `GPU_INFERENCE_URL=http://gpu:8000`
+  on `app` in the same file, so one compose command flips the whole stack into
+  GPU mode instead of relying on a separately-set env var. The sidecar mounts
+  the pinned `gpu-inference_hf_models` volume holding the HuggingFace model
+  cache, so weights are never re-downloaded after the first boot. Base
+  `docker-compose.yml` alone (no override) never sets `GPU_INFERENCE_URL`, so a
+  plain `docker compose up` always lands in offline extractive mode.
 
 Migrations run at process start (`migrateWithRetry`, 20 attempts × 1.5 s) so host
 runs work even if Postgres is still starting; under compose the healthcheck

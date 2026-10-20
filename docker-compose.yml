@@ -41,14 +41,13 @@ services:
       MAX_QUERIES_PER_DAY: ${MAX_QUERIES_PER_DAY:-100}
       UPLOAD_MAX_MB: ${UPLOAD_MAX_MB:-15}
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      # Optional: set OPENAI_API_KEY in your shell/.env to switch to LLM mode.
+      # Optional LLM provider (cloud): set OPENAI_API_KEY in .env / shell.
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
       OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-gpt-4o-mini}
-      # Optional: self-hosted GPU inference sidecar (./gpu-inference).
-      # Enable with:  $env:GPU_INFERENCE_URL="http://gpu:8000"
-      #               docker compose --profile gpu up -d --build
-      # Left empty the app runs fully offline in extractive mode.
+      # Self-hosted GPU sidecar (./gpu-inference). Normally injected by the
+      # override file docker-compose.gpu.yml; override here only to point the
+      # app at a sidecar on another host/port.
       GPU_INFERENCE_URL: ${GPU_INFERENCE_URL:-}
       GPU_CHAT_MODEL: ${GPU_CHAT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}
     depends_on:
@@ -62,60 +61,5 @@ services:
       start_period: 20s
     restart: unless-stopped
 
-  # ------------------------------------------------------------------------
-  # Optional local GPU inference sidecar lives in ./gpu-inference and is wired
-  # in by the override file docker-compose.gpu.yml (single command, no env var):
-  #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
-  # Base stack alone runs fully offline in extractive mode.
-  # ------------------------------------------------------------------------
-  gpu:
-    build: ./gpu-inference
-    container_name: documind-gpu
-    profiles: ["gpu"]
-    ports:
-      - "8100:8000"
-    environment:
-      DEVICE: auto
-      HF_HOME: /models
-      EMBED_MODEL_ID: sentence-transformers/all-MiniLM-L6-v2
-      LLM_MODEL_ID: Qwen/Qwen2.5-1.5B-Instruct
-      MAX_NEW_TOKENS: "256"
-    volumes:
-      - hf_models:/models
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
-      interval: 10s
-      timeout: 5s
-      retries: 60
-      start_period: 60s
-    restart: unless-stopped
-
-  gpu-cpu:
-    build: ./gpu-inference
-    container_name: documind-gpu-cpu
-    profiles: ["gpu-cpu"]
-    ports:
-      - "8101:8000"
-    environment:
-      DEVICE: cpu
-      HF_HOME: /models
-      EMBED_MODEL_ID: sentence-transformers/all-MiniLM-L6-v2
-      LLM_MODEL_ID: Qwen/Qwen2.5-1.5B-Instruct
-      MAX_NEW_TOKENS: "256"
-    volumes:
-      - hf_models:/models
-    restart: unless-stopped
-
 volumes:
   pgdata:
-  # Pinned name so the multi-GB HuggingFace model cache survives compose
-  # project renames instead of being re-downloaded.
-  hf_models:
-    name: gpu-inference_hf_models

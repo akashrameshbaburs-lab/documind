@@ -1,0 +1,57 @@
+# ---------------------------------------------------------------------------
+# DocuMind AI - GPU mode override file
+#
+#   GPU mode : docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#   Offline  : docker compose up -d            (base file alone, extractive mode)
+#
+# Adds the self-hosted inference sidecar (./gpu-inference, OpenAI-compatible
+# /v1 endpoints on :8100) AND points the app at it in a single command, so the
+# stack can never come up half-configured (sidecar running but app still in
+# extractive mode, or the reverse). GPU mode requires the NVIDIA container
+# runtime (Docker Desktop with the RTX 3070 enabled).
+# ---------------------------------------------------------------------------
+services:
+  app:
+    environment:
+      GPU_INFERENCE_URL: http://gpu:8000
+    depends_on:
+      gpu:
+        # Liveness only: the sidecar accepts /healthz immediately while models
+        # load in the background (~11 s from the warm model cache). Waiting for
+        # readiness here would make first-boot downloads block `compose up`.
+        condition: service_started
+
+  gpu:
+    build: ./gpu-inference
+    container_name: documind-gpu
+    ports:
+      - "8100:8000"
+    environment:
+      DEVICE: auto
+      HF_HOME: /models
+      EMBED_MODEL_ID: sentence-transformers/all-MiniLM-L6-v2
+      LLM_MODEL_ID: Qwen/Qwen2.5-1.5B-Instruct
+      MAX_NEW_TOKENS: "256"
+    volumes:
+      - hf_models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      # Liveness (not readiness): answers during model load / first-boot download.
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  # Pinned name shared with gpu-inference/docker-compose.yml so the multi-GB
+  # HuggingFace model cache is reused instead of re-downloaded on every switch.
+  hf_models:
+    name: gpu-inference_hf_models

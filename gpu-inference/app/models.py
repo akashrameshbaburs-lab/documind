@@ -2,7 +2,7 @@
 
 Two models are served behind one lock-protected manager:
   - embeddings : sentence-transformers/all-MiniLM-L6-v2 (384-dim, ~90 MB)
-  - chat       : Qwen/Qwen2.5-1.5B-Instruct (bf16 on CUDA, fp32 on CPU)
+  - chat       : Qwen/Qwen2.5-1.5B-Instruct (fp16 on CUDA, fp32 on CPU)
 
 Both use plain HuggingFace transformers; no framework lock-in, and the
 service degrades to CPU automatically when CUDA is unavailable.

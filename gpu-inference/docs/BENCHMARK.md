@@ -1,8 +1,8 @@
 # GPU sidecar benchmark — measured run
 
 Numbers below are the verbatim output of `scripts/bench.py` against the running
-sidecar (profile `gpu`, host port **8100**). Nothing is rounded, estimated or
-hand-edited.
+sidecar (started with `docker-compose.gpu.yml`, host port **8100**). Nothing is
+rounded, estimated or hand-edited.
 
 ## Environment
 
@@ -12,7 +12,7 @@ hand-edited.
 | GPU | NVIDIA GeForce RTX 3070 Laptop GPU, 8192 MB VRAM |
 | Torch | 2.5.1+cu124 (image `pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime`) |
 | Embeddings model | `sentence-transformers/all-MiniLM-L6-v2` (384-dim) |
-| Chat model | `Qwen/Qwen2.5-1.5B-Instruct` (bf16 on CUDA) |
+| Chat model | `Qwen/Qwen2.5-1.5B-Instruct` (fp16 on CUDA) |
 | Model load time | 10.23 s (from the pinned `hf_models` volume, no re-download) |
 | Concurrency | 1 — the service holds a single inference lock by design |
 

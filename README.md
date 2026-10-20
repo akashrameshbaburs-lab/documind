@@ -61,9 +61,10 @@ INGEST                                        QUERY
 DEPLOYMENT (Docker Compose)
   app :3200 (multi-stage, non-root `node`, healthcheck on /readyz)
      └─ depends_on: service_healthy ─► postgres+pgvector :5434→5432 (healthcheck pg_isready)
-     └─ optional GPU sidecar :8100 (compose profile `gpu`, RTX 3070 via nvidia
-        runtime; or profile `gpu-cpu` on 8101):  GPU_INFERENCE_URL=http://gpu:8000
-        docker compose --profile gpu up -d --build
+     └─ optional GPU sidecar :8100 via override file docker-compose.gpu.yml
+        (RTX 3070, nvidia runtime; sets GPU_INFERENCE_URL automatically —
+         one command turns GPU mode on, nothing to remember):
+        docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 ```
 
 ---
@@ -87,8 +88,8 @@ DEPLOYMENT (Docker Compose)
 | Ops | Multi-stage Dockerfile (non-root), compose healthchecks, startup migrations |
 
 **Ports:** app `3200`, Postgres `5434` (host) → `5432` (container), plus the
-optional sidecar `8100` (profile `gpu`) or `8101` (profile `gpu-cpu`) — nothing
-else is ever bound.
+optional sidecar `8100` (via `docker-compose.gpu.yml`; standalone CPU fallback
+`8101` from `gpu-inference/`) — nothing else is ever bound.
 
 ---
 
@@ -105,14 +106,18 @@ docker compose ps                      # wait until both are healthy
 Then open **http://localhost:3200**, register, upload documents, ask questions.
 
 Optional local-GPU mode (RTX-class nvidia GPU; model cache persists in the
-pinned `gpu-inference_hf_models` volume):
+pinned `gpu-inference_hf_models` volume). One flag flips the whole stack —
+sidecar **and** `GPU_INFERENCE_URL` — so it can't start half-configured:
 
 ```powershell
-docker compose --profile gpu up -d --build        # port 8100, DEVICE=auto (cuda)
-docker compose --profile gpu-cpu up -d --build    # port 8101, CPU-only fallback
-$env:GPU_INFERENCE_URL = "http://localhost:8100"  # for host-run `npm run dev`
-# then restart the app so it picks up the URL: docker compose up -d app
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#   -> app in GPU mode (answerMode:"gpu") + sidecar on port 8100 (cuda)
+# verify:  Invoke-RestMethod http://localhost:8100/v1/info
+# back to offline mode:  docker compose up -d app
 ```
+
+CPU-only machines: run the sidecar standalone from `gpu-inference/` (compose
+profile `cpu`, port 8101) and set `GPU_INFERENCE_URL=http://host.docker.internal:8101`.
 
 ### Local development
 
@@ -301,7 +306,11 @@ not silently re-embed old sets.
 writes measured results to [`docs/EVALUATION.md`](docs/EVALUATION.md) — no
 hand-written numbers.
 
-Latest run — **extractive mode, `hashing` embeddings (signed FNV-1a, 1536-d)**:
+Two measured runs of the same 50-question gold set, written by `npm run evaluate`
+(`--out` picks the file) — no hand-written numbers:
+
+**Extractive mode** — `hashing` embeddings (signed FNV-1a, 1536-d),
+[`docs/EVALUATION.md`](docs/EVALUATION.md):
 
 | Metric | Result |
 | --- | --- |
@@ -313,6 +322,26 @@ Latest run — **extractive mode, `hashing` embeddings (signed FNV-1a, 1536-d)**
 | Mean latency / p50 / p95 | **5 ms / 4 ms / 6 ms** |
 | Cache verified on repeat question | **yes** (`cached: true`) |
 | Estimated API cost | **$0.00** (offline mode) |
+
+**GPU mode** — `all-MiniLM-L6-v2` embeddings + `Qwen2.5-1.5B-Instruct` answers on
+the RTX 3070 (override file `docker-compose.gpu.yml`), [`docs/EVALUATION_GPU.md`](docs/EVALUATION_GPU.md):
+
+| Metric | Result |
+| --- | --- |
+| Retrieval Hit@3 (gold file in top-3 citations) | **100.0 %** (50/50) |
+| Page accuracy (gold file **and** page cited) | **100.0 %** (50/50) |
+| Answer Hit@3 (top-3 citations) | **100.0 %** (50/50) |
+| Keyword coverage (mean share of gold keywords in the answer) | **91.3 %** |
+| Questions with ≥ 50 % keyword coverage | **96.0 %** (48/50) |
+| Mean latency / p50 / p95 | **1585 ms / 1451 ms / 2786 ms** |
+| Cache verified on repeat question | **yes** (`cached: true`) |
+| Estimated API cost | **$0.00** (self-hosted, no paid API calls) |
+
+The honest trade-off between the two: retrieval quality is identical at this
+corpus size, keyword coverage dips 4.7 points because a 1.5B model paraphrases
+instead of quoting, and latency costs ~1.6 s per *uncached* question because
+text is actually being generated. Repeat questions are served from the cache in
+single-digit milliseconds in both modes.
 
 `scripts/demo.ps1` is the behavioural proof — **34 assertions** covering health and
 readiness, registration/login plus duplicate and bad-credential paths, token
@@ -385,7 +414,7 @@ documind/
 ├─ public/                  # offline browser UI: index.html, app.js, styles.css
 ├─ scripts/
 │  ├─ demo.ps1              # 34-assertion end-to-end suite (PowerShell 5.1)
-│  ├─ evaluate.ts           # 50-question benchmark → docs/EVALUATION.md
+│  ├─ evaluate.ts           # 50-question benchmark → docs/EVALUATION{,_GPU}.md
 │  ├─ generate-samples.js   # PDFKit fixture generator
 │  └─ probe*.ts, inspect-extract.ts   # development verification helpers
 ├─ eval/
@@ -393,20 +422,23 @@ documind/
 │  └─ docs/                 # world-facts.pdf (generated), field-notes.md
 ├─ docs/
 │  ├─ ARCHITECTURE.md       # internals: schema, fusion math, caching, limits
-│  └─ EVALUATION.md         # measured numbers from the latest run
+│  ├─ EVALUATION.md         # 50-question run, extractive mode
+│  └─ EVALUATION_GPU.md     # 50-question run, GPU mode (same gold set)
 ├─ gpu-inference/           # optional local GPU sidecar (own README + bench)
 │  ├─ app/                  # FastAPI: OpenAI-compatible /v1 endpoints
 │  ├─ scripts/bench.py      # stdlib benchmark → docs/BENCHMARK.md
 │  ├─ Dockerfile            # pytorch/pytorch:2.5.1-cuda12.4 runtime
-│  └─ docker-compose.yml    # standalone mode (compose profile `gpu` is primary)
+│  └─ docker-compose.yml    # standalone sidecar stack (own project, :8100)
 ├─ Dockerfile               # multi-stage, non-root, /readyz healthcheck
-├─ docker-compose.yml       # app + pgvector/pgvector:pg16 + optional gpu profile
+├─ docker-compose.yml       # base stack: app + pgvector/pgvector:pg16
+├─ docker-compose.gpu.yml   # GPU override: sidecar + GPU_INFERENCE_URL together
 ├─ .env.example
 └─ package.json             # build, start, dev, evaluate, generate-samples, typecheck
 ```
 
 More detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
-Measured results: [`docs/EVALUATION.md`](docs/EVALUATION.md)
+Measured results: [`docs/EVALUATION.md`](docs/EVALUATION.md) (extractive) ·
+[`docs/EVALUATION_GPU.md`](docs/EVALUATION_GPU.md) (GPU)
 
 ---
 

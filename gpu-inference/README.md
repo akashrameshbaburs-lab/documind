@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | **Embeddings** | `sentence-transformers/all-MiniLM-L6-v2` (384-dim, ~90 MB) |
-| **Chat** | `Qwen/Qwen2.5-1.5B-Instruct` (bf16 on CUDA) |
+| **Chat** | `Qwen/Qwen2.5-1.5B-Instruct` (fp16 on CUDA) |
 | **Runtime** | PyTorch 2.5 (CUDA 12.4) in Docker, nvidia container runtime |
 | **Fallback** | Automatic CPU mode (`DEVICE=cpu` or no GPU visible) |
 
@@ -45,7 +45,7 @@ any RAG app ── OpenAI SDK (base_url=http://localhost:8100/v1) ──┐
                                                                ▼
                                               ┌── fastapi app (uvicorn) ──┐
    POST /v1/embeddings  ──────────────────────►  MiniLM (SentenceTransformer)
-   POST /v1/chat/completions ─────────────────►  Qwen2.5-1.5B-Instruct (bf16)
+   POST /v1/chat/completions ─────────────────►  Qwen2.5-1.5B-Instruct (fp16)
                                               └── single lock: VRAM-safe ──┘
                                                         │ CUDA 12.4
                                                   RTX 3070 (8 GB)
@@ -60,7 +60,7 @@ any RAG app ── OpenAI SDK (base_url=http://localhost:8100/v1) ──┐
 
 Local inference removes the per-query cost of hosted LLM APIs and keeps documents on-machine. The limits, stated plainly:
 
-1. **1.5B parameters** — answers are good for summarization/extraction-grade RAG, not frontier reasoning. Swap `LLM_MODEL_ID` for a larger model if you have VRAM (Qwen2.5-7B-Instruct bf16 ≈ 15 GB — too big for this card in bf16; use a 4-bit GGUF/AWQ variant).
+1. **1.5B parameters** — answers are good for summarization/extraction-grade RAG, not frontier reasoning. Swap `LLM_MODEL_ID` for a larger model if you have VRAM (Qwen2.5-7B-Instruct at fp16 ≈ 15 GB — too big for this 8 GB card; use a 4-bit GGUF/AWQ variant).
 2. **Serial batching** — one request at a time by design; queue upstream if you need concurrency.
 3. **No streaming** — plain request/response (`stream: true` is not implemented).
 4. Downloads happen from the Hugging Face Hub on first boot (needs internet once).
