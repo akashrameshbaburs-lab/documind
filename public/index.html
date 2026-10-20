@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DocuMind AI — Document Q&amp;A Platform</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">DM</span>
+    <div>
+      <h1>DocuMind AI</h1>
+      <p class="tagline">Retrieval-augmented Q&amp;A over your own documents · pgvector hybrid search</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <span id="modeBadge" class="badge badge-muted" title="Answer mode selected from runtime configuration">mode: …</span>
+    <span id="usageBadge" class="badge badge-muted" title="Queries used today">usage: –</span>
+    <span id="userBadge" class="badge badge-muted">signed out</span>
+    <button id="logoutBtn" class="btn btn-ghost" hidden>Sign out</button>
+  </div>
+</header>
+
+<main>
+  <!-- 1. Authentication -->
+  <section class="card" id="authCard">
+    <h2>1 · Account</h2>
+    <p class="hint">Documents are private: every set is scoped to the owning user and enforced with a JWT.</p>
+    <div class="row">
+      <input id="email" type="email" placeholder="you@example.com" autocomplete="username" />
+      <input id="password" type="password" placeholder="password (min 8 chars)" autocomplete="current-password" />
+      <button id="registerBtn" class="btn">Register</button>
+      <button id="loginBtn" class="btn btn-primary">Log in</button>
+    </div>
+    <p id="authStatus" class="status"></p>
+  </section>
+
+  <!-- 2. Upload -->
+  <section class="card disabled" id="uploadCard">
+    <h2>2 · Upload documents</h2>
+    <p class="hint">PDF · DOCX · TXT · MD — multiple files per set. Max 15&nbsp;MB each. PDFs keep real page numbers; TXT/MD/DOCX use a 50-lines-per-page approximation.</p>
+    <div class="row">
+      <input id="setName" type="text" placeholder="Set name (optional)" />
+      <input id="files" type="file" multiple accept=".pdf,.docx,.txt,.md" />
+      <button id="uploadBtn" class="btn btn-primary">Upload</button>
+    </div>
+    <p id="uploadStatus" class="status"></p>
+    <ul id="setList" class="set-list"></ul>
+  </section>
+
+  <!-- 3. Ask -->
+  <section class="card disabled" id="chatCard">
+    <h2>3 · Ask a question</h2>
+    <p class="hint">Answers are grounded in retrieved passages. Offline <em>extractive</em> mode quotes sentences with <code>[source: file, p.N]</code> citations; optional <em>LLM</em> mode generates grounded prose.</p>
+    <div class="row">
+      <select id="setSelect"></select>
+      <input id="question" type="text" placeholder="e.g. Which country has the most volcanoes?" />
+      <button id="askBtn" class="btn btn-primary">Ask</button>
+    </div>
+    <div id="messages" class="messages"></div>
+  </section>
+</main>
+
+<footer>
+  <span>DocuMind AI · offline-capable RAG · Node 22 + TypeScript · Postgres 16 + pgvector</span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

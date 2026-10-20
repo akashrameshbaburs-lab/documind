@@ -1,0 +1,40 @@
+{
+  "name": "documind",
+  "version": "1.0.0",
+  "description": "DocuMind AI - offline-first Document Q&A platform (RAG) with pgvector hybrid retrieval",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/index.js",
+    "dev": "ts-node src/index.ts",
+    "generate-samples": "node scripts/generate-samples.js",
+    "evaluate": "ts-node scripts/evaluate.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "mammoth": "^1.9.1",
+    "multer": "^2.0.2",
+    "pdf-parse": "^1.1.1",
+    "pdfjs-dist": "^4.8.69",
+    "pg": "^8.13.3",
+    "pino": "^9.6.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/jsonwebtoken": "^9.0.8",
+    "@types/multer": "^1.4.12",
+    "@types/node": "^22.13.10",
+    "@types/pdf-parse": "^1.1.5",
+    "@types/pg": "^8.11.11",
+    "pdfkit": "^0.15.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.2"
+  }
+}

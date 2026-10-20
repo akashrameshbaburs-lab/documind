@@ -1,0 +1,8 @@
+node_modules
+dist
+.git
+.env
+*.log
+docs
+README.md
+scripts/demo.ps1
